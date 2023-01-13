@@ -30,9 +30,32 @@ struct TocEntry<'a> {
     digest: String,
     chunk_offset: u64,
     chunk_size: u64,
-    children: HashMap<String, &'a TocEntry<'a>>,
+    children: Option<HashMap<&'a str, &'a TocEntry<'a>>>,
 }
 
 impl<'a> TocEntry<'a> {
 
+    pub fn mod_time(&self) -> chrono::DateTime<Utc> {
+        self.mod_time
+    }
+
+    pub fn next_offset(&self) -> u64 {
+        self.next_offset
+    }
+
+    pub fn add_child(&mut self, child: &'a TocEntry, base_name: &'a str) {
+        if self.children.is_none() {
+            self.children = Some(HashMap::new());
+        }
+
+        if child.typ == "dir" {
+            self.num_link += 1;
+        }
+
+        self.children.as_mut().unwrap().insert(base_name, child);
+    }
+
+    pub fn lookup_child(self, base_name: &'a str) -> Option<&TocEntry> {
+        self.children.unwrap().get(base_name).copied()
+    }
 }
