@@ -1,3 +1,8 @@
+use std::fs::File;
+
+use stargz_rs::open;
+
 fn main() {
-    println!("Hello, world!");
+    let f = File::open("output.stargz").unwrap();
+    open::<File>(f).unwrap();
 }
