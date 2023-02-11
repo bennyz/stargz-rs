@@ -1,12 +1,10 @@
 use anyhow::{anyhow, Result};
-use chrono::serde::ts_seconds::deserialize as from_ts;
 use chrono::Utc;
 use flate2::read::GzDecoder;
 use serde::Deserialize;
 use std::{
     collections::HashMap,
     fs::{self, File},
-    io::BufReader,
     os::unix::prelude::{FileExt, MetadataExt, PermissionsExt},
     vec,
 };
@@ -15,11 +13,162 @@ use tar::Archive;
 static TOCT_TAR_NAME: &str = "stargz.index.json";
 const FOOTER_SIZE: u32 = 47;
 
-struct Reader<R: FileExt> {
-    r: BufReader<R>,
+struct Reader {
+    file: File,
     toc: JToc,
     m: HashMap<String, TocEntry>,
     chunks: HashMap<String, Vec<TocEntry>>,
+}
+
+impl Reader {
+    fn init_fields(mut self) -> Result<()> {
+        self.m = HashMap::with_capacity(self.toc.entries.len());
+        self.chunks = HashMap::new();
+        let mut last_reg_entry: Option<TocEntry> = None;
+        let mut last_path: &str;
+        let mut uname = HashMap::<u32, String>::new();
+        let mut gname = HashMap::<u32, String>::new();
+        for mut entry in &mut self.toc.entries.clone() {
+            entry.name = entry.name.trim_start_matches("./").to_owned();
+            match entry.typ.as_str() {
+                "reg" => {
+                    last_reg_entry = Some(entry.clone());
+                }
+                "chunk" => {
+                    last_path = &entry.name;
+                    match self.chunks.get_mut(&entry.name) {
+                        Some(v) => {
+                            v.push(entry.clone());
+                        }
+                        None => {
+                            self.chunks
+                                .insert(entry.name.to_owned(), vec![entry.clone()]);
+                        }
+                    };
+                    if &entry.chunk_size == &Some(0 as u64) && last_reg_entry.is_some() {
+                        let offset = entry.offset;
+                        let last_ent_size = last_reg_entry.as_ref().map(|e| e.size.unwrap());
+                        entry.chunk_size = Some(last_ent_size.unwrap() - offset.unwrap());
+                    }
+                }
+                _ => {
+                    last_path = &entry.name;
+                    match &entry.uname {
+                        Some(euname) => {
+                            uname.insert(entry.uid.unwrap(), euname.to_owned());
+                        }
+                        None => {
+                            entry.uname = uname.get(&entry.uid.unwrap()).cloned();
+                        }
+                    }
+                    match &entry.g_name {
+                        Some(egname) => {
+                            gname.insert(entry.gid.unwrap(), egname.to_owned());
+                        }
+                        None => {
+                            entry.g_name = gname.get(&entry.gid.unwrap()).cloned();
+                        }
+                    }
+
+                    entry.mod_time = Some(
+                        chrono::DateTime::parse_from_rfc3339(
+                            entry.mod_time_3339.as_ref().unwrap().as_str(),
+                        )?
+                        .into(),
+                    );
+                    if entry.typ == "dir" {
+                        entry.num_link += 1;
+                        self.m
+                            .insert(entry.name.trim_end_matches("/").to_owned(), entry.clone());
+                    } else {
+                        self.m.insert(entry.name.to_owned(), entry.clone());
+                    }
+                }
+            }
+
+            if entry.typ == "reg"
+                && entry.chunk_size.cmp(&Some(0)).is_gt()
+                && entry.chunk_size < entry.size
+            {
+                let cap = (entry.size.unwrap() / entry.chunk_size.unwrap() + 1) as usize;
+                let mut chunks: Vec<TocEntry> = Vec::with_capacity(cap);
+                chunks.push(entry.clone());
+                self.chunks.insert(entry.name.to_owned(), chunks);
+            }
+            if entry.chunk_size == Some(0) && entry.size != Some(0) {
+                entry.chunk_size = entry.size;
+            }
+
+            for entry in &mut self.toc.entries.clone() {
+                if entry.typ == "chunk" {
+                    continue;
+                }
+                let mut name = entry.name.to_owned();
+                if entry.typ == "dir" {
+                    let bind = name.trim_end_matches("/").to_owned();
+                    name = bind;
+                }
+
+                let mut parent_dir = self.get_or_create_parent_dir(&name);
+                entry.num_link += 1;
+                if entry.typ == "hardlink" {
+                    let link_name = entry.clone().link_name.unwrap();
+                    match self.m.get_mut(&link_name) {
+                        Some(original) => original.num_link += 1,
+                        None => return Err(anyhow!("{0} is a hardlink but the linkname {link_name} isn't found", entry.name))
+                    };
+                }
+                parent_dir.add_child(entry.clone(), &name);
+            }
+
+            let mut last_offset = self.file.metadata().unwrap().size();
+            for i in (0..self.toc.entries.len()).rev() {
+                match self.toc.entries.get_mut(i) {
+                    Some(e) => {
+                        if e.is_data_type() {
+                            e.next_offset = Some(last_offset);
+                        }
+                        if e.offset != Some(0) || e.offset.is_none() {
+                            last_offset = e.offset.unwrap()
+                        }
+                    }
+                    None => {},
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn get_or_create_parent_dir(&self, name: &str) -> TocEntry {
+        match self.m.get(&name.to_string()) {
+            Some(e) => e.to_owned(),
+            None => {
+                TocEntry{
+                    name: name.to_string(),
+                    typ: String::from("dir"),
+                    size: None,
+                    mode: Some(0755),
+                    mod_time_3339: None,
+                    mod_time: None,
+                    link_name: None,
+                    uid: None,
+                    gid: None,
+                    uname: None,
+                    g_name: None,
+                    offset: None,
+                    next_offset: None,
+                    dev_major: None,
+                    dev_minor: None,
+                    num_link: 2,
+                    xattrs: None,
+                    digest: None,
+                    chunk_offset: None,
+                    chunk_size: None,
+                    children: None,
+                }
+            }
+        }
+    }
 }
 
 pub fn open<R: FileExt>(input: File) -> Result<()> {
@@ -68,6 +217,7 @@ pub fn open<R: FileExt>(input: File) -> Result<()> {
     let f = File::options().read(true).open(TOCT_TAR_NAME)?;
     let toc: JToc = serde_json::from_reader(f)?;
 
+    println!("TOC {toc:#?}");
     Ok(())
 }
 
@@ -91,13 +241,13 @@ fn parse_footer(content: &[u8]) -> Result<i64> {
     Ok(toc_offset)
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct JToc {
     version: u32,
     entries: Vec<TocEntry>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 struct TocEntry {
     name: String,
 
@@ -106,6 +256,7 @@ struct TocEntry {
     size: Option<u64>,
     mod_time_3339: Option<String>,
     mod_time: Option<chrono::DateTime<Utc>>,
+    mode: Option<i64>,
     link_name: Option<String>,
     uid: Option<u32>,
     gid: Option<u32>,
