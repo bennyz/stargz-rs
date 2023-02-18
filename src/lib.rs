@@ -1,3 +1,4 @@
+mod sectionreader;
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use flate2::read::GzDecoder;
@@ -5,6 +6,7 @@ use serde::Deserialize;
 use std::{
     collections::HashMap,
     fs::{self, File},
+    io,
     os::unix::prelude::{FileExt, MetadataExt, PermissionsExt},
     vec,
 };
@@ -115,7 +117,12 @@ impl Reader {
                     let link_name = entry.clone().link_name.unwrap();
                     match self.m.get_mut(&link_name) {
                         Some(original) => original.num_link += 1,
-                        None => return Err(anyhow!("{0} is a hardlink but the linkname {link_name} isn't found", entry.name))
+                        None => {
+                            return Err(anyhow!(
+                                "{0} is a hardlink but the linkname {link_name} isn't found",
+                                entry.name
+                            ))
+                        }
                     };
                 }
                 parent_dir.add_child(entry.clone(), &name);
@@ -132,7 +139,7 @@ impl Reader {
                             last_offset = e.offset.unwrap()
                         }
                     }
-                    None => {},
+                    None => {}
                 }
             }
         }
@@ -142,33 +149,48 @@ impl Reader {
     fn get_or_create_parent_dir(&self, name: &str) -> TocEntry {
         match self.m.get(&name.to_string()) {
             Some(e) => e.to_owned(),
-            None => {
-                TocEntry{
-                    name: name.to_string(),
-                    typ: String::from("dir"),
-                    size: None,
-                    mode: Some(0755),
-                    mod_time_3339: None,
-                    mod_time: None,
-                    link_name: None,
-                    uid: None,
-                    gid: None,
-                    uname: None,
-                    g_name: None,
-                    offset: None,
-                    next_offset: None,
-                    dev_major: None,
-                    dev_minor: None,
-                    num_link: 2,
-                    xattrs: None,
-                    digest: None,
-                    chunk_offset: None,
-                    chunk_size: None,
-                    children: None,
-                }
-            }
+            None => TocEntry {
+                name: name.to_string(),
+                typ: String::from("dir"),
+                size: None,
+                mode: Some(0755),
+                mod_time_3339: None,
+                mod_time: None,
+                link_name: None,
+                uid: None,
+                gid: None,
+                uname: None,
+                g_name: None,
+                offset: None,
+                next_offset: None,
+                dev_major: None,
+                dev_minor: None,
+                num_link: 2,
+                xattrs: None,
+                digest: None,
+                chunk_offset: None,
+                chunk_size: None,
+                children: None,
+            },
         }
     }
+
+    pub fn lookup(&self, path: &str) -> Result<&TocEntry> {
+        let mut ent = self.m.get(path).unwrap();
+        if ent.typ == "hardlink" {
+            let link_name = ent.link_name.clone().unwrap();
+            ent = self.m.get(&link_name).unwrap()
+        }
+        return Ok(ent);
+    }
+
+    // pub fn open_file(&self, name: &str) -> Result<dyn io::Read> {
+    //     let ent = self.lookup(name)?;
+    //     if ent.typ != "reg" {
+    //         return Err(anyhow!("Not a regular file"));
+    //     }
+
+    // }
 }
 
 pub fn open<R: FileExt>(input: File) -> Result<()> {
