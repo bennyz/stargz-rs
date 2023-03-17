@@ -2,6 +2,7 @@ mod sectionreader;
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use flate2::read::GzDecoder;
+use sectionreader::SectionReader;
 use serde::Deserialize;
 use std::{
     collections::HashMap,
@@ -16,7 +17,7 @@ static TOCT_TAR_NAME: &str = "stargz.index.json";
 const FOOTER_SIZE: u32 = 47;
 
 struct Reader {
-    file: File,
+    sr: File,
     toc: JToc,
     m: HashMap<String, TocEntry>,
     chunks: HashMap<String, Vec<TocEntry>>,
@@ -128,7 +129,7 @@ impl Reader {
                 parent_dir.add_child(entry.clone(), &name);
             }
 
-            let mut last_offset = self.file.metadata().unwrap().size();
+            let mut last_offset = self.sr.metadata().unwrap().size();
             for i in (0..self.toc.entries.len()).rev() {
                 match self.toc.entries.get_mut(i) {
                     Some(e) => {
@@ -184,13 +185,36 @@ impl Reader {
         return Ok(ent);
     }
 
-    // pub fn open_file(&self, name: &str) -> Result<dyn io::Read> {
-    //     let ent = self.lookup(name)?;
-    //     if ent.typ != "reg" {
-    //         return Err(anyhow!("Not a regular file"));
-    //     }
+    fn get_chunks(&self, entry: &TocEntry) -> Vec<TocEntry> {
+        match self.chunks.get(&entry.name) {
+            Some(entries) => entries.clone(),
+            None => vec![entry.clone()],
+        }
+    }
 
-    // }
+    pub fn open_file<'a>(&self, name: &str) -> Result<SectionReader<File>> {
+        let ent = self.lookup(name)?;
+        if ent.typ != "reg" {
+            return Err(anyhow!("Not a regular file"));
+        }
+        let file_reader = &FileReader {
+            r: self,
+            size: ent.size,
+            ents: self.get_chunks(ent),
+        };
+
+        return Ok(SectionReader::new(
+            &file_reader.r.sr,
+            0,
+            file_reader.size.unwrap() as u32,
+        ));
+    }
+}
+
+struct FileReader<'a> {
+    r: &'a Reader,
+    size: Option<u64>,
+    ents: Vec<TocEntry>,
 }
 
 pub fn open<R: FileExt>(input: File) -> Result<()> {
