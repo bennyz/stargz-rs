@@ -1,5 +1,5 @@
 mod sectionreader;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Ok, Result};
 use chrono::Utc;
 use flate2::read::GzDecoder;
 use sectionreader::SectionReader;
@@ -7,7 +7,9 @@ use serde::Deserialize;
 use std::{
     collections::HashMap,
     fs::{self, File},
-    io,
+    io::prelude,
+    io::{self, BufReader},
+    io::{BufRead, Read},
     os::unix::prelude::{FileExt, MetadataExt, PermissionsExt},
     vec,
 };
@@ -16,7 +18,7 @@ use tar::Archive;
 static TOCT_TAR_NAME: &str = "stargz.index.json";
 const FOOTER_SIZE: u32 = 47;
 
-struct Reader {
+pub struct Reader {
     sr: File,
     toc: JToc,
     m: HashMap<String, TocEntry>,
@@ -24,7 +26,7 @@ struct Reader {
 }
 
 impl Reader {
-    fn init_fields(mut self) -> Result<()> {
+    fn init_fields(&mut self) -> Result<()> {
         self.m = HashMap::with_capacity(self.toc.entries.len());
         self.chunks = HashMap::new();
         let mut last_reg_entry: Option<TocEntry> = None;
@@ -217,7 +219,56 @@ struct FileReader<'a> {
     ents: Vec<TocEntry>,
 }
 
-pub fn open<R: FileExt>(input: File) -> Result<()> {
+impl<'a> FileReader<'a> {
+    fn read_at(&self, buf: &mut [u8], mut offset: u64) -> Result<usize> {
+        if offset > self.size.unwrap() {
+            return Err(anyhow!("offset is greater than file size"));
+        }
+        let mut i: usize = 0;
+        if self.ents.len() > 1 {
+            // Is sorting useful here?
+            let mut sorted = self.ents.clone();
+            sorted.sort_unstable_by_key(|e| e.offset.unwrap());
+
+            // Find the first entity with an offset equal or great to offset
+            i = sorted
+                .iter()
+                .position(|e| e.offset.unwrap() >= offset)
+                .unwrap_or(self.ents.len() - 1);
+        }
+
+        let mut entry = self.ents.get(i).unwrap();
+        if entry.chunk_offset.unwrap() > offset {
+            if i == 0 {
+                return Err(anyhow!("internal error; first chunk offset is non-zero"));
+            }
+            entry = self.ents.get(i - 1).unwrap();
+        }
+
+        offset -= entry.chunk_offset.unwrap();
+        let final_entry = &self.ents[self.ents.len() - 1];
+        let gz_offset = entry.offset.unwrap();
+        let gz_bytes_remain = final_entry.next_offset().unwrap() - gz_offset;
+        let sr = SectionReader::new(&self.r.sr, gz_offset as u32, gz_bytes_remain as u32);
+    
+        const MAX_GZ_READ: i32 = 2 << 20;
+    
+        let mut buf_size = MAX_GZ_READ;
+        if gz_bytes_remain > buf_size as u64 {
+            buf_size = gz_bytes_remain as i32;
+        }
+
+        // Create a buffered reader with buf_size wrapper for sr
+        let br = BufReader::with_capacity(buf_size as usize, sr);
+        let mut gz = flate2::bufread::GzDecoder::new(br);
+        // Discard until offset
+        io::copy(&mut gz.by_ref().take(offset), &mut io::sink())?;
+        let mut gz = gz.take(self.size.unwrap() as u64 - offset);
+        return Ok(gz.read(buf)?);
+    }
+}
+
+pub fn open<R: FileExt>(input: File) -> Result<Reader> {
     let size = input.metadata().unwrap().size();
     println!("File size {size}");
 
@@ -263,8 +314,16 @@ pub fn open<R: FileExt>(input: File) -> Result<()> {
     let f = File::options().read(true).open(TOCT_TAR_NAME)?;
     let toc: JToc = serde_json::from_reader(f)?;
 
-    println!("TOC {toc:#?}");
-    Ok(())
+    let mut reader = Reader {
+        sr: input,
+        toc,
+        m: HashMap::new(),
+        chunks: HashMap::new(),
+    };
+
+    reader.init_fields()?;
+
+    Ok(reader)
 }
 
 fn parse_footer(content: &[u8]) -> Result<i64> {
@@ -294,7 +353,7 @@ struct JToc {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-struct TocEntry {
+pub struct TocEntry {
     name: String,
 
     #[serde(rename(serialize = "type", deserialize = "type"))]
