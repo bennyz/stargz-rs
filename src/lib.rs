@@ -211,6 +211,36 @@ impl Reader {
             file_reader.size.unwrap() as u32,
         ));
     }
+
+    pub fn chunk_entry_for_offset(&self, name: &str, offset: u64) -> Option<&TocEntry> {
+        let ent = self.lookup(name);
+        if ent.is_err() {
+            return None;
+        }
+        let ent = ent.unwrap();
+        if !ent.is_data_type() {
+            return None;
+        }
+        let ents = self.chunks.get(&ent.name).unwrap();
+        if ents.len() < 2 {
+            if offset >= ent.chunk_size.unwrap() {
+                return None;
+            }
+            return Some(ent);
+        }
+        let i = ents
+            .iter()
+            .position(|e| {
+                e.offset.unwrap() >= offset
+                    || (offset > e.chunk_offset.unwrap()
+                        && offset < e.chunk_offset.unwrap() + e.chunk_size.unwrap())
+            })
+            .unwrap_or(ents.len() - 1);
+        if i == ents.len() - 1 {
+            return None;
+        }
+        return Some(&ents[i]);
+    }
 }
 
 struct FileReader<'a> {
@@ -250,9 +280,9 @@ impl<'a> FileReader<'a> {
         let gz_offset = entry.offset.unwrap();
         let gz_bytes_remain = final_entry.next_offset().unwrap() - gz_offset;
         let sr = SectionReader::new(&self.r.sr, gz_offset as u32, gz_bytes_remain as u32);
-    
+
         const MAX_GZ_READ: i32 = 2 << 20;
-    
+
         let mut buf_size = MAX_GZ_READ;
         if gz_bytes_remain > buf_size as u64 {
             buf_size = gz_bytes_remain as i32;
