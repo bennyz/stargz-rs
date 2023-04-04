@@ -7,9 +7,8 @@ use serde::Deserialize;
 use std::{
     collections::HashMap,
     fs::{self, File},
-    io::prelude,
+    io::Read,
     io::{self, BufReader},
-    io::{BufRead, Read},
     os::unix::prelude::{FileExt, MetadataExt, PermissionsExt},
     vec,
 };
@@ -30,7 +29,7 @@ impl Reader {
         self.m = HashMap::with_capacity(self.toc.entries.len());
         self.chunks = HashMap::new();
         let mut last_reg_entry: Option<TocEntry> = None;
-        let mut last_path: &str;
+        let mut last_path: &str = "";
         let mut uname = HashMap::<u32, String>::new();
         let mut gname = HashMap::<u32, String>::new();
         for mut entry in &mut self.toc.entries.clone() {
@@ -40,7 +39,7 @@ impl Reader {
                     last_reg_entry = Some(entry.clone());
                 }
                 "chunk" => {
-                    last_path = &entry.name;
+                    entry.name = last_path.to_owned();
                     match self.chunks.get_mut(&entry.name) {
                         Some(v) => {
                             v.push(entry.clone());
@@ -50,37 +49,38 @@ impl Reader {
                                 .insert(entry.name.to_owned(), vec![entry.clone()]);
                         }
                     };
-                    if &entry.chunk_size == &Some(0 as u64) && last_reg_entry.is_some() {
-                        let offset = entry.offset;
-                        let last_ent_size = last_reg_entry.as_ref().map(|e| e.size.unwrap());
-                        entry.chunk_size = Some(last_ent_size.unwrap() - offset.unwrap());
+                    if entry.chunk_size == 0 && last_reg_entry.is_some() {
+                        let last_ent_size = last_reg_entry.clone().unwrap().size;
+                        entry.chunk_size = last_ent_size - entry.chunk_offset;
                     }
                 }
                 _ => {
                     last_path = &entry.name;
-                    match &entry.uname {
-                        Some(euname) => {
-                            uname.insert(entry.uid.unwrap(), euname.to_owned());
+                    match entry.uname.as_str() {
+                        _ => {
+                            uname.insert(entry.uid, entry.uname.clone());
                         }
-                        None => {
-                            entry.uname = uname.get(&entry.uid.unwrap()).cloned();
+                        "" => {
+                            entry.uname = uname.get(&entry.uid).unwrap().to_string();
                         }
                     }
-                    match &entry.g_name {
-                        Some(egname) => {
-                            gname.insert(entry.gid.unwrap(), egname.to_owned());
+                    match entry.g_name.as_str() {
+                        _ => {
+                            gname.insert(entry.gid, entry.g_name.clone());
                         }
-                        None => {
-                            entry.g_name = gname.get(&entry.gid.unwrap()).cloned();
+                        "" => {
+                            entry.g_name = gname.get(&entry.gid).unwrap().to_string();
                         }
                     }
 
-                    entry.mod_time = Some(
-                        chrono::DateTime::parse_from_rfc3339(
-                            entry.mod_time_3339.as_ref().unwrap().as_str(),
-                        )?
-                        .into(),
-                    );
+                    if entry.mod_time_3339.is_some() {
+                        entry.mod_time = Some(
+                            chrono::DateTime::parse_from_rfc3339(
+                                &entry.mod_time_3339.as_ref().unwrap(),
+                            )?
+                            .into(),
+                        );
+                    }
                     if entry.typ == "dir" {
                         entry.num_link += 1;
                         self.m
@@ -91,16 +91,13 @@ impl Reader {
                 }
             }
 
-            if entry.typ == "reg"
-                && entry.chunk_size.cmp(&Some(0)).is_gt()
-                && entry.chunk_size < entry.size
-            {
-                let cap = (entry.size.unwrap() / entry.chunk_size.unwrap() + 1) as usize;
+            if entry.typ == "reg" && entry.chunk_size > 0 && entry.chunk_size < entry.size {
+                let cap = (entry.size / entry.chunk_size + 1) as usize;
                 let mut chunks: Vec<TocEntry> = Vec::with_capacity(cap);
                 chunks.push(entry.clone());
                 self.chunks.insert(entry.name.to_owned(), chunks);
             }
-            if entry.chunk_size == Some(0) && entry.size != Some(0) {
+            if entry.chunk_size == 0 && entry.size != 0 {
                 entry.chunk_size = entry.size;
             }
 
@@ -117,7 +114,7 @@ impl Reader {
                 let mut parent_dir = self.get_or_create_parent_dir(&name);
                 entry.num_link += 1;
                 if entry.typ == "hardlink" {
-                    let link_name = entry.clone().link_name.unwrap();
+                    let link_name = entry.link_name.clone();
                     match self.m.get_mut(&link_name) {
                         Some(original) => original.num_link += 1,
                         None => {
@@ -136,10 +133,10 @@ impl Reader {
                 match self.toc.entries.get_mut(i) {
                     Some(e) => {
                         if e.is_data_type() {
-                            e.next_offset = Some(last_offset);
+                            e.next_offset = last_offset;
                         }
-                        if e.offset != Some(0) || e.offset.is_none() {
-                            last_offset = e.offset.unwrap()
+                        if e.offset != 0 {
+                            last_offset = e.offset
                         }
                     }
                     None => {}
@@ -155,25 +152,25 @@ impl Reader {
             None => TocEntry {
                 name: name.to_string(),
                 typ: String::from("dir"),
-                size: None,
-                mode: Some(0755),
+                size: 0,
+                mode: 0755,
                 mod_time_3339: None,
                 mod_time: None,
-                link_name: None,
-                uid: None,
-                gid: None,
-                uname: None,
-                g_name: None,
-                offset: None,
-                next_offset: None,
-                dev_major: None,
-                dev_minor: None,
+                link_name: "".to_string(),
+                uid: 0,
+                gid: 0,
+                uname: "".to_string(),
+                g_name: "".to_string(),
+                offset: 0,
+                next_offset: 0,
+                dev_major: 0,
+                dev_minor: 0,
                 num_link: 2,
-                xattrs: None,
-                digest: None,
-                chunk_offset: None,
-                chunk_size: None,
-                children: None,
+                xattrs: HashMap::new(),
+                digest: "".to_string(),
+                chunk_offset: 0,
+                chunk_size: 0,
+                children: HashMap::new(),
             },
         }
     }
@@ -181,8 +178,8 @@ impl Reader {
     pub fn lookup(&self, path: &str) -> Result<&TocEntry> {
         let mut ent = self.m.get(path).unwrap();
         if ent.typ == "hardlink" {
-            let link_name = ent.link_name.clone().unwrap();
-            ent = self.m.get(&link_name).unwrap()
+            let link_name = &ent.link_name;
+            ent = self.m.get(link_name).unwrap()
         }
         return Ok(ent);
     }
@@ -208,7 +205,7 @@ impl Reader {
         return Ok(SectionReader::new(
             &file_reader.r.sr,
             0,
-            file_reader.size.unwrap() as u32,
+            file_reader.size as u32,
         ));
     }
 
@@ -223,7 +220,7 @@ impl Reader {
         }
         let ents = self.chunks.get(&ent.name).unwrap();
         if ents.len() < 2 {
-            if offset >= ent.chunk_size.unwrap() {
+            if offset >= ent.chunk_size {
                 return None;
             }
             return Some(ent);
@@ -231,9 +228,8 @@ impl Reader {
         let i = ents
             .iter()
             .position(|e| {
-                e.offset.unwrap() >= offset
-                    || (offset > e.chunk_offset.unwrap()
-                        && offset < e.chunk_offset.unwrap() + e.chunk_size.unwrap())
+                e.offset >= offset
+                    || (offset > e.chunk_offset && offset < e.chunk_offset + e.chunk_size)
             })
             .unwrap_or(ents.len() - 1);
         if i == ents.len() - 1 {
@@ -245,40 +241,40 @@ impl Reader {
 
 struct FileReader<'a> {
     r: &'a Reader,
-    size: Option<u64>,
+    size: u64,
     ents: Vec<TocEntry>,
 }
 
 impl<'a> FileReader<'a> {
     fn read_at(&self, buf: &mut [u8], mut offset: u64) -> Result<usize> {
-        if offset > self.size.unwrap() {
+        if offset > self.size {
             return Err(anyhow!("offset is greater than file size"));
         }
         let mut i: usize = 0;
         if self.ents.len() > 1 {
             // Is sorting useful here?
             let mut sorted = self.ents.clone();
-            sorted.sort_unstable_by_key(|e| e.offset.unwrap());
+            sorted.sort_unstable_by_key(|e| e.offset);
 
             // Find the first entity with an offset equal or great to offset
             i = sorted
                 .iter()
-                .position(|e| e.offset.unwrap() >= offset)
+                .position(|e| e.offset >= offset)
                 .unwrap_or(self.ents.len() - 1);
         }
 
         let mut entry = self.ents.get(i).unwrap();
-        if entry.chunk_offset.unwrap() > offset {
+        if entry.chunk_offset > offset {
             if i == 0 {
                 return Err(anyhow!("internal error; first chunk offset is non-zero"));
             }
             entry = self.ents.get(i - 1).unwrap();
         }
 
-        offset -= entry.chunk_offset.unwrap();
+        offset -= entry.chunk_offset;
         let final_entry = &self.ents[self.ents.len() - 1];
-        let gz_offset = entry.offset.unwrap();
-        let gz_bytes_remain = final_entry.next_offset().unwrap() - gz_offset;
+        let gz_offset = entry.offset;
+        let gz_bytes_remain = final_entry.next_offset() - gz_offset;
         let sr = SectionReader::new(&self.r.sr, gz_offset as u32, gz_bytes_remain as u32);
 
         const MAX_GZ_READ: i32 = 2 << 20;
@@ -293,7 +289,7 @@ impl<'a> FileReader<'a> {
         let mut gz = flate2::bufread::GzDecoder::new(br);
         // Discard until offset
         io::copy(&mut gz.by_ref().take(offset), &mut io::sink())?;
-        let mut gz = gz.take(self.size.unwrap() as u64 - offset);
+        let mut gz = gz.take(self.size as u64 - offset);
         return Ok(gz.read(buf)?);
     }
 }
@@ -388,29 +384,57 @@ pub struct TocEntry {
 
     #[serde(rename(serialize = "type", deserialize = "type"))]
     typ: String,
-    size: Option<u64>,
+
+    #[serde(default)]
+    size: u64,
+
     mod_time_3339: Option<String>,
     mod_time: Option<chrono::DateTime<Utc>>,
-    mode: Option<i64>,
-    link_name: Option<String>,
-    uid: Option<u32>,
-    gid: Option<u32>,
-    uname: Option<String>,
-    g_name: Option<String>,
-    offset: Option<u64>,
-    next_offset: Option<u64>,
-    dev_major: Option<u32>,
-    dev_minor: Option<u32>,
 
-    #[serde(rename(serialize = "NumLink", deserialize = "NumLink"))]
+    #[serde(default)]
+    mode: u32,
+
+    #[serde(default, rename = "linkName")]
+    link_name: String,
+
+    #[serde(default)]
+    uid: u32,
+    #[serde(default)]
+    gid: u32,
+
+    #[serde(default)]
+    uname: String,
+    #[serde(default)]
+    g_name: String,
+
+    #[serde(default)]
+    offset: u64,
+
+    #[serde(default)]
+    next_offset: u64,
+
+    #[serde(default, rename = "devMajor")]
+    dev_major: u64,
+
+    #[serde(default, rename = "devMinor")]
+    dev_minor: u64,
+
+    #[serde(default, rename(serialize = "NumLink", deserialize = "NumLink"))]
     num_link: u32,
-    xattrs: Option<HashMap<String, Vec<u8>>>,
-    digest: Option<String>,
-    chunk_offset: Option<u64>,
-    chunk_size: Option<u64>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    children: Option<HashMap<String, TocEntry>>,
+    #[serde(default)]
+    xattrs: HashMap<String, Vec<u8>>,
+
+    #[serde(default)]
+    digest: String,
+
+    #[serde(default, rename = "chunkOffset")]
+    chunk_offset: u64,
+    #[serde(default, rename = "chunkSize")]
+    chunk_size: u64,
+
+    #[serde(skip)]
+    children: HashMap<String, TocEntry>,
 }
 
 impl TocEntry {
@@ -418,28 +442,20 @@ impl TocEntry {
         self.mod_time
     }
 
-    pub fn next_offset(&self) -> Option<u64> {
+    pub fn next_offset(&self) -> u64 {
         self.next_offset
     }
 
     pub fn add_child(&mut self, child: TocEntry, base_name: &str) {
-        if self.children.is_none() {
-            self.children = Some(HashMap::new());
-        }
-
         if child.typ == "dir" {
             self.num_link += 1;
         }
 
-        self.children
-            .as_mut()
-            .unwrap()
-            .insert(base_name.to_owned(), child);
+        self.children.insert(base_name.to_owned(), child);
     }
 
-    pub fn lookup_child(self, base_name: &str) -> Option<TocEntry> {
-        let children = self.children.unwrap();
-        children.get(base_name).cloned()
+    pub fn lookup_child(&self, base_name: &str) -> Option<&TocEntry> {
+        self.children.get(base_name)
     }
 
     pub fn is_data_type(&self) -> bool {
