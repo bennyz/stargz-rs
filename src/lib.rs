@@ -57,19 +57,19 @@ impl Reader {
                 _ => {
                     last_path = &entry.name;
                     match entry.uname.as_str() {
-                        _ => {
-                            uname.insert(entry.uid, entry.uname.clone());
-                        }
                         "" => {
                             entry.uname = uname.get(&entry.uid).unwrap().to_string();
                         }
+                        _ => {
+                            uname.insert(entry.uid, entry.uname.clone());
+                        }
                     }
                     match entry.g_name.as_str() {
-                        _ => {
-                            gname.insert(entry.gid, entry.g_name.clone());
-                        }
                         "" => {
                             entry.g_name = gname.get(&entry.gid).unwrap().to_string();
+                        }
+                        _ => {
+                            gname.insert(entry.gid, entry.g_name.clone());
                         }
                     }
 
