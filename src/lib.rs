@@ -12,10 +12,8 @@ use std::{
     io::Read,
     io::{self, BufReader, BufWriter, Cursor, Write},
     os::unix::prelude::{FileExt, MetadataExt, PermissionsExt},
-    pin::Pin,
     rc::Rc,
-    sync::Mutex,
-    vec,
+    vec, ops::DerefMut,
 };
 use tar::Archive;
 
@@ -501,24 +499,9 @@ impl<'a> FileInfo<'a> {
     }
 }
 
-pub struct SharedBuffer<'a> {
-    inner: RefCell<BufWriter<&'a mut dyn Write>>,
-}
-
-impl<'a> Write for SharedBuffer<'a> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.borrow_mut().write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.borrow_mut().flush()
-    }
-}
-
 pub struct Writer<'a, W: Write> {
-    writer: &'a mut W,
-    gz: Option<GzEncoder<W>>,
-
+    cw: Rc<RefCell<CountingWriter<W>>>,
+    gz: Option<GzEncoder<CountingWriter<W>>>,
     toc: JToc,
     diff_hash: sha2::Sha256,
     last_username: HashMap<i32, &'a str>,
@@ -529,10 +512,12 @@ pub struct Writer<'a, W: Write> {
 
 impl<'a, W: Write> Writer<'a, W> {
     // Accept a writer and build Writer from it
-    pub fn new(writer: &'a mut W) -> Self {
+    pub fn new(writer: W) -> Self {
         let jtoc = JToc::new(1);
+        let bw = BufWriter::new(writer);
+        let cw = Rc::new(RefCell::new(CountingWriter::new(bw)));
         Self {
-            writer,
+            cw,
             gz: None,
             toc: jtoc,
             diff_hash: sha2::Digest::new(),
@@ -615,32 +600,29 @@ fn is_gzip(br: &mut BufReader<&mut dyn Read>) -> bool {
     return peek[0] == GZIP_ID1 && peek[1] == GZIP_ID2 && peek[2] == GZIP_DEFLATE;
 }
 
-#[derive(Debug, Clone)]
-pub struct CountingWriter<W> {
-    inner: W,
+#[derive(Debug)]
+pub struct CountingWriter<W: std::io::Write> {
+    inner: BufWriter<W>,
     count: u64,
 }
 
-impl<W> CountingWriter<W> {
-    pub fn new(writer: W) -> Self {
-        Self {
-            inner: writer,
-            count: 0,
-        }
+impl<W: std::io::Write> CountingWriter<W> {
+    pub fn new(bw: BufWriter<W>) -> Self {
+        Self { inner: bw, count: 0 }
     }
 }
-
 impl<W: Write> Write for CountingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let result = self.inner.write(buf);
+        let mut inner = self.inner.borrow_mut();
+        let result = inner.deref_mut().write(buf);
         if let Result::Ok(n) = result {
             self.count += n as u64;
         }
-
+    
         result
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+        self.inner.borrow_mut().deref_mut().flush()
     }
 }
