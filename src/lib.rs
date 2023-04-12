@@ -1,15 +1,20 @@
 mod sectionreader;
 use anyhow::{anyhow, Ok, Result};
 use chrono::Utc;
-use flate2::read::GzDecoder;
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use sectionreader::SectionReader;
 use serde::Deserialize;
 use std::{
+    borrow::{Borrow, BorrowMut},
+    cell::RefCell,
     collections::HashMap,
     fs::{self, File},
     io::Read,
-    io::{self, BufReader},
+    io::{self, BufReader, BufWriter, Cursor, Write},
     os::unix::prelude::{FileExt, MetadataExt, PermissionsExt},
+    pin::Pin,
+    rc::Rc,
+    sync::Mutex,
     vec,
 };
 use tar::Archive;
@@ -17,14 +22,14 @@ use tar::Archive;
 static TOCT_TAR_NAME: &str = "stargz.index.json";
 const FOOTER_SIZE: u32 = 47;
 
-pub struct Reader {
+pub struct GzReader {
     sr: File,
     toc: JToc,
     m: HashMap<String, TocEntry>,
     chunks: HashMap<String, Vec<TocEntry>>,
 }
 
-impl Reader {
+impl GzReader {
     fn init_fields(&mut self) -> Result<()> {
         self.m = HashMap::with_capacity(self.toc.entries.len());
         self.chunks = HashMap::new();
@@ -34,7 +39,7 @@ impl Reader {
         let mut gname = HashMap::<u32, String>::new();
         for mut entry in &mut self.toc.entries.clone() {
             entry.name = entry.name.trim_start_matches("./").to_owned();
-            match entry.typ.as_str() {
+            match entry.entry_type.as_str() {
                 "reg" => {
                     last_reg_entry = Some(entry.clone());
                 }
@@ -81,7 +86,7 @@ impl Reader {
                             .into(),
                         );
                     }
-                    if entry.typ == "dir" {
+                    if entry.entry_type == "dir" {
                         entry.num_link += 1;
                         self.m
                             .insert(entry.name.trim_end_matches("/").to_owned(), entry.clone());
@@ -91,7 +96,7 @@ impl Reader {
                 }
             }
 
-            if entry.typ == "reg" && entry.chunk_size > 0 && entry.chunk_size < entry.size {
+            if entry.entry_type == "reg" && entry.chunk_size > 0 && entry.chunk_size < entry.size {
                 let cap = (entry.size / entry.chunk_size + 1) as usize;
                 let mut chunks: Vec<TocEntry> = Vec::with_capacity(cap);
                 chunks.push(entry.clone());
@@ -102,18 +107,18 @@ impl Reader {
             }
 
             for entry in &mut self.toc.entries.clone() {
-                if entry.typ == "chunk" {
+                if entry.entry_type == "chunk" {
                     continue;
                 }
                 let mut name = entry.name.to_owned();
-                if entry.typ == "dir" {
+                if entry.entry_type == "dir" {
                     let bind = name.trim_end_matches("/").to_owned();
                     name = bind;
                 }
 
                 let mut parent_dir = self.get_or_create_parent_dir(&name);
                 entry.num_link += 1;
-                if entry.typ == "hardlink" {
+                if entry.entry_type == "hardlink" {
                     let link_name = entry.link_name.clone();
                     match self.m.get_mut(&link_name) {
                         Some(original) => original.num_link += 1,
@@ -151,7 +156,7 @@ impl Reader {
             Some(e) => e.to_owned(),
             None => TocEntry {
                 name: name.to_string(),
-                typ: String::from("dir"),
+                entry_type: String::from("dir"),
                 size: 0,
                 mode: 0755,
                 mod_time_3339: None,
@@ -177,7 +182,7 @@ impl Reader {
 
     pub fn lookup(&self, path: &str) -> Result<&TocEntry> {
         let mut ent = self.m.get(path).unwrap();
-        if ent.typ == "hardlink" {
+        if ent.entry_type == "hardlink" {
             let link_name = &ent.link_name;
             ent = self.m.get(link_name).unwrap()
         }
@@ -193,7 +198,7 @@ impl Reader {
 
     pub fn open_file<'a>(&self, name: &str) -> Result<SectionReader<File>> {
         let ent = self.lookup(name)?;
-        if ent.typ != "reg" {
+        if ent.entry_type != "reg" {
             return Err(anyhow!("Not a regular file"));
         }
         let file_reader = &FileReader {
@@ -240,7 +245,7 @@ impl Reader {
 }
 
 struct FileReader<'a> {
-    r: &'a Reader,
+    r: &'a GzReader,
     size: u64,
     ents: Vec<TocEntry>,
 }
@@ -294,7 +299,7 @@ impl<'a> FileReader<'a> {
     }
 }
 
-pub fn open<R: FileExt>(input: File) -> Result<Reader> {
+pub fn open<R: FileExt>(input: File) -> Result<GzReader> {
     let size = input.metadata().unwrap().size();
     println!("File size {size}");
 
@@ -340,7 +345,7 @@ pub fn open<R: FileExt>(input: File) -> Result<Reader> {
     let f = File::options().read(true).open(TOCT_TAR_NAME)?;
     let toc: JToc = serde_json::from_reader(f)?;
 
-    let mut reader = Reader {
+    let mut reader = GzReader {
         sr: input,
         toc,
         m: HashMap::new(),
@@ -373,9 +378,18 @@ fn parse_footer(content: &[u8]) -> Result<i64> {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-struct JToc {
+pub struct JToc {
     version: u32,
     entries: Vec<TocEntry>,
+}
+
+impl JToc {
+    pub fn new(version: u32) -> Self {
+        Self {
+            version,
+            entries: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -383,7 +397,7 @@ pub struct TocEntry {
     name: String,
 
     #[serde(rename(serialize = "type", deserialize = "type"))]
-    typ: String,
+    entry_type: String,
 
     #[serde(default)]
     size: u64,
@@ -447,7 +461,7 @@ impl TocEntry {
     }
 
     pub fn add_child(&mut self, child: TocEntry, base_name: &str) {
-        if child.typ == "dir" {
+        if child.entry_type == "dir" {
             self.num_link += 1;
         }
 
@@ -459,6 +473,174 @@ impl TocEntry {
     }
 
     pub fn is_data_type(&self) -> bool {
-        self.typ == "reg" || self.typ == "chunk"
+        self.entry_type == "reg" || self.entry_type == "chunk"
+    }
+}
+
+struct FileInfo<'a>(&'a TocEntry);
+
+impl<'a> FileInfo<'a> {
+    pub fn new(toc_entry: &'a TocEntry) -> Self {
+        Self(toc_entry)
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.0.entry_type == "dir"
+    }
+
+    pub fn mode(&self) -> u32 {
+        match self.0.entry_type.as_str() {
+            "dir" => 0o755,
+            "file" => 0o644,
+            "symlink" => 0o777,
+            "char" => 0o666,
+            "block" => 0o666,
+            "fifo" => 0o666,
+            _ => 0,
+        }
+    }
+}
+
+pub struct SharedBuffer<'a> {
+    inner: RefCell<BufWriter<&'a mut dyn Write>>,
+}
+
+impl<'a> Write for SharedBuffer<'a> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.borrow_mut().write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.borrow_mut().flush()
+    }
+}
+
+pub struct Writer<'a, W: Write> {
+    writer: &'a mut W,
+    gz: Option<GzEncoder<W>>,
+
+    toc: JToc,
+    diff_hash: sha2::Sha256,
+    last_username: HashMap<i32, &'a str>,
+    last_groupname: HashMap<i32, &'a str>,
+    chunk_size: usize,
+    closed: bool,
+}
+
+impl<'a, W: Write> Writer<'a, W> {
+    // Accept a writer and build Writer from it
+    pub fn new(writer: &'a mut W) -> Self {
+        let jtoc = JToc::new(1);
+        Self {
+            writer,
+            gz: None,
+            toc: jtoc,
+            diff_hash: sha2::Digest::new(),
+            last_username: HashMap::new(),
+            last_groupname: HashMap::new(),
+            chunk_size: 0,
+            closed: false,
+        }
+    }
+
+    pub fn chunk_size(&self) -> usize {
+        if self.chunk_size <= 0 {
+            return 4 << 20;
+        }
+
+        self.chunk_size
+    }
+
+    pub fn close(&mut self) -> Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        self.close_gz()?;
+
+        //let toc_offset = self.
+
+        self.closed = true;
+
+        Ok(())
+    }
+
+    fn close_gz(&mut self) -> Result<()> {
+        if self.closed {
+            return Err(anyhow!("Writer is closed"));
+        }
+        if let Some(gz) = self.gz.take() {
+            let mut gz = gz.finish()?;
+            gz.flush()?;
+        }
+
+        Ok(())
+    }
+
+    pub fn append_tar(r: &mut dyn Read) -> Result<()> {
+        let mut br = BufReader::new(r);
+
+        // TODO Check if r is a gzip file
+        let gz = GzDecoder::new(br);
+        let mut tar = tar::Archive::new(gz);
+
+        for entry in tar.entries()? {
+            let mut f = entry?;
+            // check if name is TOCT_TAR_NAME
+            if f.path()?.to_str().unwrap().contains(TOCT_TAR_NAME) {
+                continue;
+            }
+            let mut xattrs: HashMap<String, &[u8]> = HashMap::new();
+            if let Some(exts) = f.pax_extensions()? {
+                for ext in exts {
+                    let ext = ext?;
+                    let key = ext.key().unwrap_or("");
+                    if key.starts_with("SCHILY.xattr.") {
+                        xattrs.insert(key["SCHILY.xattr.".len()..].to_string(), ext.value_bytes());
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn is_gzip(br: &mut BufReader<&mut dyn Read>) -> bool {
+    const GZIP_ID1: u8 = 0x1f;
+    const GZIP_ID2: u8 = 0x8b;
+    const GZIP_DEFLATE: u8 = 8;
+    let mut peek = [0u8; 3];
+    Cursor::new(peek);
+    br.read_exact(&mut peek).unwrap();
+    return peek[0] == GZIP_ID1 && peek[1] == GZIP_ID2 && peek[2] == GZIP_DEFLATE;
+}
+
+#[derive(Debug, Clone)]
+pub struct CountingWriter<W> {
+    inner: W,
+    count: u64,
+}
+
+impl<W> CountingWriter<W> {
+    pub fn new(writer: W) -> Self {
+        Self {
+            inner: writer,
+            count: 0,
+        }
+    }
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let result = self.inner.write(buf);
+        if let Result::Ok(n) = result {
+            self.count += n as u64;
+        }
+
+        result
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
