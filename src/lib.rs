@@ -1,19 +1,20 @@
 mod sectionreader;
 use anyhow::{anyhow, Ok, Result};
-use chrono::Utc;
-use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use chrono::{DateTime, TimeZone, Utc};
+use flate2::{read::GzDecoder, write::GzEncoder};
 use sectionreader::SectionReader;
 use serde::Deserialize;
 use std::{
-    borrow::{Borrow, BorrowMut},
+    borrow::BorrowMut,
     cell::RefCell,
     collections::HashMap,
     fs::{self, File},
     io::Read,
-    io::{self, BufReader, BufWriter, Cursor, Write},
+    io::{self, BufReader, BufWriter, Write},
+    ops::DerefMut,
     os::unix::prelude::{FileExt, MetadataExt, PermissionsExt},
     rc::Rc,
-    vec, ops::DerefMut,
+    vec,
 };
 use tar::Archive;
 
@@ -67,12 +68,12 @@ impl GzReader {
                             uname.insert(entry.uid, entry.uname.clone());
                         }
                     }
-                    match entry.g_name.as_str() {
+                    match entry.gname.as_str() {
                         "" => {
-                            entry.g_name = gname.get(&entry.gid).unwrap().to_string();
+                            entry.gname = gname.get(&entry.gid).unwrap().to_string();
                         }
                         _ => {
-                            gname.insert(entry.gid, entry.g_name.clone());
+                            gname.insert(entry.gid, entry.gname.clone());
                         }
                     }
 
@@ -163,7 +164,7 @@ impl GzReader {
                 uid: 0,
                 gid: 0,
                 uname: "".to_string(),
-                g_name: "".to_string(),
+                gname: "".to_string(),
                 offset: 0,
                 next_offset: 0,
                 dev_major: 0,
@@ -194,7 +195,7 @@ impl GzReader {
         }
     }
 
-    pub fn open_file<'a>(&self, name: &str) -> Result<SectionReader<File>> {
+    pub fn open_file(&self, name: &str) -> Result<SectionReader<File>> {
         let ent = self.lookup(name)?;
         if ent.entry_type != "reg" {
             return Err(anyhow!("Not a regular file"));
@@ -297,7 +298,7 @@ impl<'a> FileReader<'a> {
     }
 }
 
-pub fn open<R: FileExt>(input: File) -> Result<GzReader> {
+pub fn open<'a, R: FileExt>(input: File) -> Result<GzReader> {
     let size = input.metadata().unwrap().size();
     println!("File size {size}");
 
@@ -390,7 +391,7 @@ impl JToc {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct TocEntry {
     name: String,
 
@@ -417,7 +418,7 @@ pub struct TocEntry {
     #[serde(default)]
     uname: String,
     #[serde(default)]
-    g_name: String,
+    gname: String,
 
     #[serde(default)]
     offset: u64,
@@ -563,41 +564,55 @@ impl<'a, W: Write> Writer<'a, W> {
 
     pub fn append_tar(r: &mut dyn Read) -> Result<()> {
         let mut br = BufReader::new(r);
-
-        // TODO Check if r is a gzip file
-        let gz = GzDecoder::new(br);
-        let mut tar = tar::Archive::new(gz);
-
+        let mut is_gzipped = [0; 3];
+        br.read_exact(&mut is_gzipped)?;
+        let is_gzipped = is_gzipped == [0x1f, 0x8b, 0x08];
+        let mut tar: Archive<Box<dyn Read>>;
+        if is_gzipped {
+            let gz = GzDecoder::new(br);
+            tar = tar::Archive::new(Box::new(gz));
+        } else {
+            tar = tar::Archive::new(Box::new(br));
+        }
         for entry in tar.entries()? {
             let mut f = entry?;
             // check if name is TOCT_TAR_NAME
             if f.path()?.to_str().unwrap().contains(TOCT_TAR_NAME) {
                 continue;
             }
-            let mut xattrs: HashMap<String, &[u8]> = HashMap::new();
+            let mut xattrs: HashMap<String, Vec<u8>> = HashMap::new();
             if let Some(exts) = f.pax_extensions()? {
                 for ext in exts {
                     let ext = ext?;
                     let key = ext.key().unwrap_or("");
                     if key.starts_with("SCHILY.xattr.") {
-                        xattrs.insert(key["SCHILY.xattr.".len()..].to_string(), ext.value_bytes());
+                        xattrs.insert(
+                            key["SCHILY.xattr.".len()..].to_string(),
+                            ext.value_bytes().to_vec(),
+                        );
                     }
                 }
             }
+
+            // TODO: Might want to check the variant of LocalResult
+            let datetime = Utc.timestamp_opt(f.header().mtime()? as i64, 0).unwrap();
+            let ent = TocEntry {
+                entry_type: "file".to_string(),
+                name: f.path()?.to_str().unwrap().to_string(),
+                size: f.size(),
+                mod_time: Some(datetime),
+                uid: f.header().uid()? as u32,
+                gid: f.header().gid()? as u32,
+                uname: f.header().username()?.unwrap_or("").to_string(),
+                gname: f.header().groupname()?.unwrap_or("").to_string(),
+                mode: f.header().mode()?,
+                xattrs,
+                ..Default::default()
+            };
         }
 
         Ok(())
     }
-}
-
-fn is_gzip(br: &mut BufReader<&mut dyn Read>) -> bool {
-    const GZIP_ID1: u8 = 0x1f;
-    const GZIP_ID2: u8 = 0x8b;
-    const GZIP_DEFLATE: u8 = 8;
-    let mut peek = [0u8; 3];
-    Cursor::new(peek);
-    br.read_exact(&mut peek).unwrap();
-    return peek[0] == GZIP_ID1 && peek[1] == GZIP_ID2 && peek[2] == GZIP_DEFLATE;
 }
 
 #[derive(Debug)]
@@ -608,7 +623,10 @@ pub struct CountingWriter<W: std::io::Write> {
 
 impl<W: std::io::Write> CountingWriter<W> {
     pub fn new(bw: BufWriter<W>) -> Self {
-        Self { inner: bw, count: 0 }
+        Self {
+            inner: bw,
+            count: 0,
+        }
     }
 }
 impl<W: Write> Write for CountingWriter<W> {
@@ -618,7 +636,7 @@ impl<W: Write> Write for CountingWriter<W> {
         if let Result::Ok(n) = result {
             self.count += n as u64;
         }
-    
+
         result
     }
 
