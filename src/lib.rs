@@ -1,17 +1,15 @@
 mod sectionreader;
 use anyhow::{anyhow, Ok, Result};
-use chrono::{DateTime, TimeZone, Utc};
-use flate2::{read::GzDecoder, write::GzEncoder};
+use chrono::{TimeZone, Utc};
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use sectionreader::SectionReader;
 use serde::Deserialize;
 use std::{
-    borrow::BorrowMut,
     cell::RefCell,
     collections::HashMap,
     fs::{self, File},
     io::Read,
     io::{self, BufReader, BufWriter, Write},
-    ops::DerefMut,
     os::unix::prelude::{FileExt, MetadataExt, PermissionsExt},
     rc::Rc,
     vec,
@@ -500,9 +498,21 @@ impl<'a> FileInfo<'a> {
     }
 }
 
+struct CountingWriterWrapper<W: Write>(Rc<RefCell<CountingWriter<W>>>);
+
+impl<W: Write> Write for CountingWriterWrapper<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (*self.0).borrow_mut().write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        (*self.0).borrow_mut().flush()
+    }
+}
+
 pub struct Writer<'a, W: Write> {
     cw: Rc<RefCell<CountingWriter<W>>>,
-    gz: Option<GzEncoder<CountingWriter<W>>>,
+    gz: Option<GzEncoder<CountingWriterWrapper<W>>>,
     toc: JToc,
     diff_hash: sha2::Sha256,
     last_username: HashMap<i32, &'a str>,
@@ -550,6 +560,15 @@ impl<'a, W: Write> Writer<'a, W> {
         Ok(())
     }
 
+    fn cond_open_gz(&mut self) -> Result<()> {
+        if self.gz.is_none() {
+            let gz = GzEncoder::new(CountingWriterWrapper(self.cw.clone()), Compression::best());
+            self.gz = Some(gz);
+        }
+
+        Ok(())
+    }
+
     fn close_gz(&mut self) -> Result<()> {
         if self.closed {
             return Err(anyhow!("Writer is closed"));
@@ -562,7 +581,7 @@ impl<'a, W: Write> Writer<'a, W> {
         Ok(())
     }
 
-    pub fn append_tar(r: &mut dyn Read) -> Result<()> {
+    pub fn append_tar(&mut self, r: &mut dyn Read) -> Result<()> {
         let mut br = BufReader::new(r);
         let mut is_gzipped = [0; 3];
         br.read_exact(&mut is_gzipped)?;
@@ -596,7 +615,7 @@ impl<'a, W: Write> Writer<'a, W> {
 
             // TODO: Might want to check the variant of LocalResult
             let datetime = Utc.timestamp_opt(f.header().mtime()? as i64, 0).unwrap();
-            let ent = TocEntry {
+            let mut ent = TocEntry {
                 entry_type: "file".to_string(),
                 name: f.path()?.to_str().unwrap().to_string(),
                 size: f.size(),
@@ -609,6 +628,57 @@ impl<'a, W: Write> Writer<'a, W> {
                 xattrs,
                 ..Default::default()
             };
+            self.cond_open_gz()?;
+            let mut builder = tar::Builder::new(self.gz.as_mut().unwrap());
+            // Create a new header and copy metadata from the entry's header
+            let mut h = tar::Header::new_gnu();
+            h.set_path(f.path()?)?;
+            h.set_size(f.header().size()?);
+            h.set_mode(f.header().mode()?);
+            h.set_uid(f.header().uid()?);
+            h.set_gid(f.header().gid()?);
+            h.set_mtime(f.header().mtime()?);
+            h.set_entry_type(f.header().entry_type());
+
+            // Append the new header and the entry's content to the tar builder
+            builder.append(&h, &mut f)?;
+
+            match h.entry_type() {
+                tar::EntryType::Link => {
+                    ent.entry_type = "hardlink".to_string();
+                    // TODO: do something more sensible here
+                    ent.link_name = h.link_name()?.unwrap().to_str().unwrap().to_string();
+                }
+                tar::EntryType::Symlink => {
+                    ent.entry_type = "symlink".to_string();
+
+                    // TODO: do something more sensible here
+                    ent.link_name = h.link_name()?.unwrap().to_str().unwrap().to_string();
+                }
+                tar::EntryType::Directory => {
+                    ent.entry_type = "dir".to_string();
+                }
+                tar::EntryType::Regular => {
+                    ent.entry_type = "reg".to_string();
+                    ent.size = h.size()?;
+                }
+                tar::EntryType::Char => {
+                    ent.entry_type = "char".to_string();
+                    ent.dev_major = h.device_major()?.unwrap_or(0).try_into()?;
+                    ent.dev_minor = h.device_minor()?.unwrap_or(0).try_into()?;
+                }
+                tar::EntryType::Block => {
+                    ent.entry_type = "block".to_string();
+                    ent.dev_major = h.device_major()?.unwrap_or(0).try_into()?;
+                    ent.dev_minor = h.device_minor()?.unwrap_or(0).try_into()?;
+                }
+                tar::EntryType::Fifo => {
+                    ent.entry_type = "fifo".to_string();
+                }
+                _ => {
+                    return Err(anyhow!("unsupported input tar entry {:?}", h.entry_type()));
+                }
+            }
         }
 
         Ok(())
@@ -631,8 +701,7 @@ impl<W: std::io::Write> CountingWriter<W> {
 }
 impl<W: Write> Write for CountingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut inner = self.inner.borrow_mut();
-        let result = inner.deref_mut().write(buf);
+        let result = self.inner.write(buf);
         if let Result::Ok(n) = result {
             self.count += n as u64;
         }
@@ -641,6 +710,6 @@ impl<W: Write> Write for CountingWriter<W> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.borrow_mut().deref_mut().flush()
+        self.inner.flush()
     }
 }
