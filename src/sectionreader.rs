@@ -1,72 +1,138 @@
 use std::{
-    io::{Error, ErrorKind, Read},
+    io::Read,
     os::unix::prelude::FileExt,
 };
 
+/// A reader that reads a section of an underlying reader.
+/// Similar to Go's io.SectionReader.
 pub struct SectionReader<'a, R: FileExt> {
     reader: &'a R,
-    base: u32,
-    offset: u32,
-    limit: u32,
+    #[allow(dead_code)]
+    base: u64,
+    offset: u64,
+    limit: u64,
 }
 
 impl<'a, R: FileExt> SectionReader<'a, R> {
-    pub fn new(reader: &'a R, offset: u32, n: u32) -> Self {
-        let remaining: u32;
-        if offset <= u32::MAX - n {
-            remaining = n + offset;
-        } else {
-            remaining = u32::MAX;
-        }
+    pub fn new(reader: &'a R, offset: u64, n: u64) -> Self {
+        let limit = offset.saturating_add(n);
         SectionReader {
             reader,
             base: offset,
             offset,
-            limit: remaining,
+            limit,
         }
     }
 
-    pub fn read_at(&mut self, buf: &mut [u8], mut offset: u32) -> std::io::Result<usize> {
+    #[allow(dead_code)]
+    pub fn size(&self) -> u64 {
+        self.limit - self.base
+    }
+
+    #[allow(dead_code)]
+    pub fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
         if offset >= self.limit - self.base {
-            return Err(Error::new(ErrorKind::InvalidInput, "Invalid offset"));
+            return Ok(0); // EOF
         }
 
-        offset += self.base;
-        let max = (self.limit - self.offset) as usize;
-        let mut n: usize = 0;
+        let abs_offset = self.base + offset;
+        let max = (self.limit - abs_offset) as usize;
 
         if buf.len() > max {
-            n = self.reader.read_at(&mut buf[0..max], offset.into())?;
+            self.reader.read_at(&mut buf[0..max], abs_offset)
         } else {
-            n = self.reader.read_at(buf, offset.into())?;
+            self.reader.read_at(buf, abs_offset)
         }
-
-        Ok(n)
-    }
-
-    pub fn inner(&self) -> &R {
-        return &self.reader;
     }
 }
 
 impl<'a, R: FileExt> Read for SectionReader<'a, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.offset >= self.limit {
-            return Err(Error::new(
-                ErrorKind::UnexpectedEof,
-                "offset larger than limit",
-            ));
+            return Ok(0); // EOF, not an error
         }
         let max = (self.limit - self.offset) as usize;
-        let mut n: usize = 0;
-        if buf.len() > max {
-            n = self.reader.read_at(&mut buf[0..max], self.offset.into())?;
+        let n = if buf.len() > max {
+            self.reader.read_at(&mut buf[0..max], self.offset)?
         } else {
-            n = self.reader.read_at(buf, self.offset.into())?;
-        }
+            self.reader.read_at(buf, self.offset)?
+        };
 
-        self.offset += n as u32;
-
+        self.offset += n as u64;
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_section_reader_basic() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"Hello, World!").unwrap();
+        file.flush().unwrap();
+
+        let f = file.reopen().unwrap();
+        let sr = SectionReader::new(&f, 7, 5); // "World"
+
+        let mut buf = [0u8; 5];
+        let n = sr.read_at(&mut buf, 0).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf, b"World");
+    }
+
+    #[test]
+    fn test_section_reader_partial() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"Hello, World!").unwrap();
+        file.flush().unwrap();
+
+        let f = file.reopen().unwrap();
+        let sr = SectionReader::new(&f, 7, 5);
+
+        let mut buf = [0u8; 10]; // larger than section
+        let n = sr.read_at(&mut buf, 0).unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..5], b"World");
+    }
+
+    #[test]
+    fn test_section_reader_offset() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"Hello, World!").unwrap();
+        file.flush().unwrap();
+
+        let f = file.reopen().unwrap();
+        let sr = SectionReader::new(&f, 7, 5);
+
+        let mut buf = [0u8; 3];
+        let n = sr.read_at(&mut buf, 2).unwrap(); // "rld"
+        assert_eq!(n, 3);
+        assert_eq!(&buf, b"rld");
+    }
+
+    #[test]
+    fn test_section_reader_sequential() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"Hello, World!").unwrap();
+        file.flush().unwrap();
+
+        let f = file.reopen().unwrap();
+        let mut sr = SectionReader::new(&f, 0, 5); // "Hello"
+
+        let mut buf = [0u8; 3];
+        let n = sr.read(&mut buf).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(&buf, b"Hel");
+
+        let n = sr.read(&mut buf).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(&buf[..2], b"lo");
+
+        let n = sr.read(&mut buf).unwrap();
+        assert_eq!(n, 0); // EOF
     }
 }
